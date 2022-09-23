@@ -1,0 +1,13 @@
+{
+  "dependencies": {
+    "hardhat": "^2.11.2"
+  },
+  "scripts": {
+    "clean": "npx hardhat clean",
+    "compile": "npx hardhat compile",
+    "test": "npx hardhat test"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^2.0.0"
+  }
+}
