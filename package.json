@@ -3,6 +3,7 @@
     "@openzeppelin/contracts": "^4.8.0-rc.1",
     "hardhat": "^2.11.2"
   },
+  "license": "MIT",
   "scripts": {
     "clean": "npx hardhat clean",
     "compile": "npx hardhat compile",
