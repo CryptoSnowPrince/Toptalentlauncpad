@@ -28,37 +28,63 @@ contract Toptalentlauncpad is Context, IERC20, IERC20Metadata, Auth {
 
     address public burnWallet;
     address public marketingWallet;
-    address public liquidityPool;
+    address public liquidityWallet;
 
-    address public pair;
+    address public router;
+
+    uint256 public minAmountToAdd;
+    bool public isTradingEnabled;
+
+    bool private inSwapAndLiquify;
 
     event LogFallback(address indexed from, uint256 indexed amount);
     event LogReceive(address indexed from, uint256 indexed amount);
 
-    event LogSetPair(address indexed pair);
-    event LogSetLiquidityPool(address indexed liquidityPool);
+    event LogSetLiquidityWallet(address indexed liquidityWallet);
     event LogSetMarketingWallet(address indexed marketingWallet);
     event LogSetBurnWallet(address indexed burnWallet);
+    event LogSetMinAmountToAdd(uint256 indexed minAmountToAdd);
+    event LogSetIsTradingEnabled(bool isTradingEnabled);
+    event LogSetRouter(address indexed router);
+
+    event LogSwapAndLiquidity(
+        uint256 tokensSwapped,
+        uint256 ethReceived,
+        uint256 tokensIntoLiquidity
+    );
+    event LogMint(address indexed account, uint256 indexed amount);
+    event LogBurn(address indexed account, uint256 indexed amount);
 
     constructor(
         string memory name_,
         string memory symbol_,
         address _router,
         address _marketingWallet,
-        address _liquidityPool
+        address _liquidityWallet,
+        uint256 _minAmountToAdd,
+        bool _isTradingEnabled
     ) {
         _name = name_;
         _symbol = symbol_;
         _mint(msg.sender, 333444555 * 10**18);
 
-        pair = IFactory(IRouter(_router).factory()).createPair(
+        IFactory(IRouter(_router).factory()).createPair(
             address(this),
             IRouter(_router).WETH()
         );
 
         setBurnWallet(address(0xdead));
         setMarketingWallet(_marketingWallet);
-        setLiquidityPool(_liquidityPool);
+        setLiquidityWallet(_liquidityWallet);
+        setMinAmountToAdd(_minAmountToAdd);
+        setIsTradingEnabled(_isTradingEnabled);
+        setRouter(_router);
+    }
+
+    modifier lockSwap() {
+        inSwapAndLiquify = true;
+        _;
+        inSwapAndLiquify = false;
     }
 
     /**
@@ -261,6 +287,23 @@ contract Toptalentlauncpad is Context, IERC20, IERC20Metadata, Auth {
      * - `to` cannot be the zero address.
      * - `from` must have a balance of at least `amount`.
      */
+    function _basicTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual authorized {
+        unchecked {
+            _balances[from] -= amount;
+            // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
+            // decrementing then incrementing.
+            _balances[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
     function _transfer(
         address from,
         address to,
@@ -276,16 +319,86 @@ contract Toptalentlauncpad is Context, IERC20, IERC20Metadata, Auth {
             fromBalance >= amount,
             "ERC20: transfer amount exceeds balance"
         );
+
+        if (!isTradingEnabled) {
+            return _basicTransfer(from, to, amount);
+        }
+
+        bool canAddLiquidity = _balances[address(this)] >= minAmountToAdd;
+
+        if (canAddLiquidity && !inSwapAndLiquify) {
+            swapAndAddLiquidity(minAmountToAdd);
+        }
+
+        uint256 burnFeeAmount = (amount * burnFee) / feeDenominator;
+        uint256 marketingFeeAmount = (amount * marketingFee) / feeDenominator;
+        uint256 liquidityFeeAmount = (amount * liquidityFee) / feeDenominator;
+
+        uint256 transferAmount = amount -
+            (burnFeeAmount + marketingFeeAmount + liquidityFeeAmount);
         unchecked {
             _balances[from] = fromBalance - amount;
             // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
             // decrementing then incrementing.
-            _balances[to] += amount;
+            _balances[to] += transferAmount;
+
+            _balances[burnWallet] += burnFeeAmount;
+            _balances[marketingWallet] += marketingFeeAmount;
+            _balances[address(this)] += liquidityFeeAmount;
         }
 
-        emit Transfer(from, to, amount);
+        emit Transfer(from, burnWallet, burnFeeAmount);
+        emit Transfer(from, marketingWallet, marketingFeeAmount);
+        emit Transfer(from, address(this), liquidityFeeAmount);
+
+        emit Transfer(from, to, transferAmount);
 
         _afterTokenTransfer(from, to, amount);
+    }
+
+    function swapAndAddLiquidity(uint256 amounts) private lockSwap {
+        uint256 half = amounts / 2;
+        uint256 otherHalf = amounts - half;
+
+        uint256 initialBalance = address(this).balance;
+
+        swapTokensForETH(half);
+
+        uint256 newBalance = address(this).balance - initialBalance;
+
+        addLiquidity(otherHalf, newBalance);
+
+        emit LogSwapAndLiquidity(half, newBalance, otherHalf);
+    }
+
+    function swapTokensForETH(uint256 tokenAmount) private {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = IRouter(router).WETH();
+
+        _approve(address(this), router, tokenAmount);
+
+        IRouter(router).swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0, // slippage is unavoidable
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
+        _approve(address(this), router, tokenAmount);
+
+        // Skip `Return value check`
+        IRouter(router).addLiquidityETH{value: ethAmount}(
+            address(this),
+            tokenAmount,
+            0, // slippage is unavoidable
+            0, // slippage is unavoidable
+            liquidityWallet,
+            block.timestamp
+        );
     }
 
     /** @dev Creates `amount` tokens and assigns them to `account`, increasing
@@ -440,34 +553,19 @@ contract Toptalentlauncpad is Context, IERC20, IERC20Metadata, Auth {
         emit LogFallback(msg.sender, msg.value);
     }
 
-    function setPair(address _pair) public authorized {
+    function setLiquidityWallet(address _liquidityWallet) public authorized {
         require(
-            address(_pair) != address(0),
+            address(_liquidityWallet) != address(0),
             "Toptalentlauncpad: ZERO_ADDRESS"
         );
         require(
-            address(_pair) != address(pair),
+            address(_liquidityWallet) != address(liquidityWallet),
             "Toptalentlauncpad: SAME_ADDRESS"
         );
 
-        pair = _pair;
+        liquidityWallet = _liquidityWallet;
 
-        emit LogSetPair(address(pair));
-    }
-
-    function setLiquidityPool(address _liquidityPool) public authorized {
-        require(
-            address(_liquidityPool) != address(0),
-            "Toptalentlauncpad: ZERO_ADDRESS"
-        );
-        require(
-            address(_liquidityPool) != address(liquidityPool),
-            "Toptalentlauncpad: SAME_ADDRESS"
-        );
-
-        liquidityPool = _liquidityPool;
-
-        emit LogSetLiquidityPool(liquidityPool);
+        emit LogSetLiquidityWallet(liquidityWallet);
     }
 
     function setMarketingWallet(address _marketingWallet) public authorized {
@@ -498,5 +596,77 @@ contract Toptalentlauncpad is Context, IERC20, IERC20Metadata, Auth {
         burnWallet = _burnWallet;
 
         emit LogSetBurnWallet(burnWallet);
+    }
+
+    function setMinAmountToAdd(uint256 _minAmountToAdd) public authorized {
+        require(_minAmountToAdd > 0, "Toptalentlauncpad: ZERO_AMOUNT");
+        require(
+            _minAmountToAdd != minAmountToAdd,
+            "Toptalentlauncpad: SAME_AMOUNT"
+        );
+
+        minAmountToAdd = _minAmountToAdd;
+
+        emit LogSetMinAmountToAdd(minAmountToAdd);
+    }
+
+    function setIsTradingEnabled(bool _isTradingEnabled) public authorized {
+        require(
+            isTradingEnabled != _isTradingEnabled,
+            "Toptalentlauncpad: SAME_VALUE"
+        );
+        isTradingEnabled = _isTradingEnabled;
+
+        emit LogSetIsTradingEnabled(isTradingEnabled);
+    }
+
+    function setRouter(address _router) public authorized {
+        require(
+            address(_router) != address(0),
+            "Toptalentlauncpad: ZERO_ADDRESS"
+        );
+        require(
+            address(_router) != address(router),
+            "Toptalentlauncpad: SAME_ADDRESS"
+        );
+
+        router = _router;
+
+        emit LogSetRouter(router);
+    }
+
+    function mint(address account, uint256 amount) external authorized {
+        _mint(account, amount);
+
+        emit LogMint(account, amount);
+    }
+
+    function burn(address account, uint256 amount) external authorized {
+        _burn(account, amount);
+
+        emit LogBurn(account, amount);
+    }
+
+    function withdrawFakeAsset(
+        IERC20 _token,
+        address _recipient,
+        uint256 _amount
+    ) external authorized {
+        if ((address(this)).balance > 0) {
+            payable(_recipient).transfer((address(this)).balance);
+        }
+
+        require(
+            address(_token) != address(this),
+            "Toptalentlauncpad: CANNOT_WITHDRAW_STAKING_TOKEN"
+        );
+        require(
+            _amount <= _token.balanceOf(address(this)),
+            "Toptalentlauncpad: INSUFFICIENT_FUNDS"
+        );
+        require(
+            _token.transfer(_recipient, _amount),
+            "Toptalentlauncpad: FAIL_TRANSFER"
+        );
     }
 }
